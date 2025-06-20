@@ -3,8 +3,12 @@ putchar(c) {
 }
 
 malloc() {
-    return(0x0200);
+    return (0x200);
 }
+// __heap_ptr 0x200;
+// malloc(size) {
+//     return(__heap_ptr += size);
+// }
 
 // TODO: add other arguments
 printf(str) {
@@ -17,8 +21,24 @@ printf(str) {
         if (c == '\n') {
             putchar(0xD); // \r
         }
-        putchar(c); // ECHO
+        putchar(c);
         i++;
         c = char(str, i);
     }
+}
+
+// read a single byte
+byte(addr) {
+    extrn char;
+    return (char(addr, 0));
+}
+
+getchar() {
+    while ((byte(0xD011) < 0) == 0) {}
+    auto b;
+    b = byte(0xD010) & 0x7F;
+    if (b == 0xD) {
+        b = '\n';
+    }
+    return (b);
 }
