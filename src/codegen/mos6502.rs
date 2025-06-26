@@ -750,6 +750,7 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
         instr16(out, STA, ABS_X, STACK_PAGE + stack_size as u16 - 2*i);
     }
 
+    let mut last_is_return = false;
     for i in 0..body.len() {
         let addr_idx = *op_addresses.items.add(i);
         *(*asm).addresses.items.add(addr_idx) = (*out).count as u16; // update op address
@@ -762,10 +763,14 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
                     load_arg(arg, op.loc, out, asm);
                 }
 
-                // jump to ret statement
-                instr0(out, JMP, ABS);
-                add_reloc(out, RelocationKind::AddressAbs
-                          {idx: *op_addresses.items.add(body.len())}, asm);
+                if i+1 == body.len() {
+                    last_is_return = true;
+                } else {
+                    // jump to ret statement
+                    instr0(out, JMP, ABS);
+                    add_reloc(out, RelocationKind::AddressAbs
+                              {idx: *op_addresses.items.add(body.len())}, asm);
+                }
             },
             Op::Store {index, arg} => {
                 load_auto_var(out, index, asm);
@@ -1251,8 +1256,10 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
         }
     }
 
-    instr8(out, LDA, IMM, 0);
-    instr(out, TAY);
+    if !last_is_return {
+        instr8(out, LDA, IMM, 0);
+        instr(out, TAY);
+    }
 
     let addr_idx = *op_addresses.items.add(body.len());
     *(*asm).addresses.items.add(addr_idx) = (*out).count as u16;
@@ -1263,6 +1270,7 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
         add_sp(out, stack_size, asm);
         instr8(out, LDA, ZP, ZP_TMP_0);
     }
+
     instr(out, RTS);
 }
 
