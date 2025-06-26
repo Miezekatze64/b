@@ -1195,9 +1195,8 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
                     },
                     _ => { // function pointer already loaded in ZP_DEREF_FUN
                         // there is no jsr (indirect), so emulate using jsr and jmp (indirect).
-                        instr16(out, JSR, ABS, (*asm).code_start + (*out).count as u16 + 6);
-                        instr16(out, JMP, ABS, (*asm).code_start + (*out).count as u16 + 6);
-                        instr16(out, JMP, IND, ZP_DEREF_FUN_0 as u16);
+                        instr0(out, JSR, ABS);
+                        add_reloc(out, RelocationKind::External{name: c!("$indirect_jmp"), offset: 0, byte: Byte::Both}, asm);
                     },
                 }
                 if args.count > 1 {
@@ -1345,16 +1344,16 @@ pub unsafe fn generate_extrns(out: *mut String_Builder, extrns: *const [*const c
             }
         }
 
+        let fun_addr = (*out).count as u16;
+        da_append(&mut (*asm).externals, External {
+            name,
+            addr: fun_addr,
+        });
+
         // TODO: consider implementing all these intrinsics in __asm__ if possible
         if strcmp(name, c!("char")) == 0 {
             // ch = char(string, i);
             // returns the ith character in a string pointed to by string, 0 based
-
-            let fun_addr = (*out).count as u16;
-            da_append(&mut (*asm).externals, External {
-                name,
-                addr: fun_addr,
-            });
 
             instr(out, TSX);
             instr(out, CLC);
@@ -1382,12 +1381,6 @@ pub unsafe fn generate_extrns(out: *mut String_Builder, extrns: *const [*const c
             // ch = char(string, i, ch);
             // returns the ith character in a string pointed to by string, 0 based
 
-            let fun_addr = (*out).count as u16;
-            da_append(&mut (*asm).externals, External {
-                name,
-                addr: fun_addr,
-            });
-
             instr(out, TSX);
             instr(out, CLC);
 
@@ -1411,6 +1404,8 @@ pub unsafe fn generate_extrns(out: *mut String_Builder, extrns: *const [*const c
             // instr(output, DEY);
 
             instr(out, RTS);
+        } else if strcmp(name, c!("$indirect_jmp")) == 0 {
+            instr16(out, JMP, IND, ZP_DEREF_FUN_0 as u16);
         } else {
             fprintf(stderr(), c!("Unknown extrn: `%s`, can not link\n"), name);
             abort();
@@ -1501,13 +1496,19 @@ pub unsafe fn generate_asm_funcs(out: *mut String_Builder, asm_funcs: *const [As
     }
 }
 
-pub unsafe fn generate_program(out: *mut String_Builder, c: *const Compiler, config: Config) -> Option<()> {
+pub unsafe fn add_instrinsics(c: *mut Compiler) {
+    da_append(&mut (*c).extrns, c!("$indirect_jmp"));
+}
+
+pub unsafe fn generate_program(out: *mut String_Builder, c: *mut Compiler, config: Config) -> Option<()> {
     let mut asm: Assembler = zeroed();
     generate_entry(out, &mut asm);
     asm.code_start = config.load_offset;
 
     generate_funcs(out, da_slice((*c).funcs), &mut asm);
     generate_asm_funcs(out, da_slice((*c).asm_funcs), &mut asm);
+
+    add_instrinsics(c);
     generate_extrns(out, da_slice((*c).extrns), da_slice((*c).funcs), da_slice((*c).globals), &mut asm);
 
     let data_start = config.load_offset + (*out).count as u16;

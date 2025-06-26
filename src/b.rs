@@ -1590,7 +1590,7 @@ pub unsafe fn main(mut argc: i32, mut argv: *mut*mut c_char) -> Option<()> {
         }
         Target::Mos6502 => {
             let config = codegen::mos6502::parse_config_from_link_flags(da_slice(*linker))?;
-            codegen::mos6502::generate_program(&mut output, &c, config);
+            codegen::mos6502::generate_program(&mut output, &mut c, config);
 
             let effective_output_path;
             if (*output_path).is_null() {
