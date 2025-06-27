@@ -340,8 +340,8 @@ pub unsafe fn load_auto_var_ref(out: *mut String_Builder, index: usize, asm: *mu
     instr8(out, LDY, IMM, (STACK_PAGE >> 8) as u8);
 }
 
-// the operations here are not allowed to change any register exctept the target
-// and have to keep the carry flag.
+// The operations here are not allowed to change any register exctept the target
+// and have to keep the carry flag. Do NOT modify X here!
 pub unsafe fn load_arg_simple(arg: Arg, loc: Loc, out: *mut String_Builder, asm: *mut Assembler,
                               instr: Instr, high: bool) {
     match arg {
@@ -402,11 +402,12 @@ pub unsafe fn load_arg_opt(arg: Arg, _loc: Loc, out: *mut String_Builder, asm: *
             // Y = ((0),1)
             instr8(out, LDY, IMM, 1);
             instr8(out, LDA, IND_Y, ZP_DEREF_0);
-            instr(out, TAY);
+            instr8(out, STA, ZP, ZP_TMP_0);
 
-            // A = ((0,0))
-            instr8(out, LDX, IMM, 0);
-            instr8(out, LDA, IND_X, ZP_DEREF_0);
+            // A = ((0), 0)
+            instr(out, DEY);
+            instr8(out, LDA, IND_Y, ZP_DEREF_0);
+            instr8(out, LDY, ZP, ZP_TMP_0);
         },
         Arg::AutoVar(index) => load_auto_var(out, index, asm),
         Arg::RefAutoVar(index) => load_auto_var_ref(out, index, asm),
@@ -435,6 +436,41 @@ pub unsafe fn instr8_opt(out: *mut String_Builder, arg: Arg, loc: Loc, asm: *mut
         }
     } else {
         load_arg_simple(arg, loc, out, asm, instr, high);
+    }
+}
+
+// binary operations that can be mapped to a single instruction
+pub unsafe fn binop_simple(out: *mut String_Builder,
+                           asm: *mut Assembler, lhs: Arg, rhs: Arg,
+                           op: OpWithLocation, inst: Instr,
+                           carry: Option<bool>) {
+    let v2 = load_arg_opt(rhs, op. loc, out, asm);
+    if let Some(_) = v2 {
+        instr8(out, STA, ZP, ZP_RHS_L);
+        instr8(out, STY, ZP, ZP_RHS_H);
+    }
+    let v1 = load_arg_opt(lhs, op.loc, out, asm);
+    if let Some(carry) = carry {
+        if carry {
+            instr(out, SEC);
+        } else {
+            instr(out, CLC);
+        }
+    }
+
+    if v1.is_none() {
+        load_arg_simple(lhs, op.loc, out, asm, LDA, true);
+        instr8_opt(out, rhs, op.loc, asm, inst, v2, true);
+        instr(out, TAY);
+        load_arg_simple(lhs, op.loc, out, asm, LDA, false);
+        instr8_opt(out, rhs, op.loc, asm, inst, v2, false);
+    } else {
+        instr8_opt(out, rhs, op.loc, asm, inst, v2, false);
+        instr(out, TAX);
+        instr(out, TYA);
+        instr8_opt(out, rhs, op.loc, asm, inst, v2, true);
+        instr(out, TAY);
+        instr(out, TXA);
     }
 }
 
@@ -494,7 +530,7 @@ pub unsafe fn pop16_discard(out: *mut String_Builder, asm: *mut Assembler) {
 }
 
 // load lhs in Y:A, rhs in RHS_L:RHS_H, returns None, if optimizable
-pub unsafe fn load_two_args(out: *mut String_Builder, lhs: Arg, rhs: Arg, op: OpWithLocation, asm: *mut Assembler) -> Option<()>{
+pub unsafe fn load_two_args(out: *mut String_Builder, lhs: Arg, rhs: Arg, op: OpWithLocation, asm: *mut Assembler) -> Option<()> {
     let r = load_arg_opt(rhs, op. loc, out, asm);
     if let Some(_) = r {
         instr8(out, STA, ZP, ZP_RHS_L);
@@ -503,7 +539,6 @@ pub unsafe fn load_two_args(out: *mut String_Builder, lhs: Arg, rhs: Arg, op: Op
     load_arg(lhs, op.loc, out, asm);
     r
 }
-
 // load lhs in Y:A, rhs in RHS_L:RHS_H
 pub unsafe fn load_two_args_no_opt(out: *mut String_Builder, lhs: Arg, rhs: Arg, op: OpWithLocation, asm: *mut Assembler) {
     load_arg(rhs, op. loc, out, asm);
@@ -511,6 +546,8 @@ pub unsafe fn load_two_args_no_opt(out: *mut String_Builder, lhs: Arg, rhs: Arg,
     instr8(out, STY, ZP, ZP_RHS_H);
     load_arg(lhs, op.loc, out, asm);
 }
+
+
 
 // TODO: maybe recover from errors?
 pub unsafe fn parse_num(line_begin: *const c_char, mut line: *const c_char, mut loc: Loc) -> (u16, *const c_char) {
@@ -798,8 +835,8 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
     let stack_size = (auto_vars_count * 2) as u8;
     sub_sp(out, stack_size, asm);
 
+    instr(out, TSX);
     for i in 0..(params_count as u16) {
-        instr(out, TSX);
         if i == 0 {
             // low
             instr16(out, STA, ABS_X, STACK_PAGE + stack_size as u16 - 2*i - 1);
@@ -847,6 +884,7 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
                 instr8(out, STY, ZP, ZP_DEREF_STORE_1);
 
                 load_arg(arg, op.loc, out, asm);
+
                 instr(out, TAX);
                 instr(out, TYA);
 
@@ -870,8 +908,8 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
             Op::Negate {result, arg} => { // Y:A -> 0 - Y:A
                 let v = load_arg_opt(arg, op.loc, out, asm);
                 if v.is_some() {
-                    instr8(out, STA, ZP, ZP_TMP_0);
-                    instr8(out, STY, ZP, ZP_TMP_1);
+                    instr8(out, STA, ZP, ZP_RHS_L);
+                    instr8(out, STY, ZP, ZP_RHS_H);
                 }
 
                 instr8(out, LDA, IMM, 0);
@@ -889,8 +927,8 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
             },
             Op::UnaryNot{result, arg} => {
                 if load_arg_opt(arg, op.loc, out, asm).is_some() {
-                    instr8(out, STY, ZP, ZP_TMP_0);
-                    instr8(out, ORA, ZP, ZP_TMP_0);
+                    instr8(out, STY, ZP, ZP_RHS_L);
+                    instr8(out, ORA, ZP, ZP_RHS_H);
                 } else {
                     load_arg_simple(arg, op.loc, out, asm, LDA, false);
                     load_arg_simple(arg, op.loc, out, asm, ORA, true);
@@ -905,26 +943,8 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
             },
             Op::Binop {binop, index, lhs, rhs} => {
                 match binop {
-                    Binop::BitOr => {
-                        let v = load_two_args(out, lhs, rhs, op, asm);
-
-                        instr8_opt(out, rhs, op.loc, asm, ORA, v, false);
-                        instr(out, TAX);
-                        instr(out, TYA);
-                        instr8_opt(out, rhs, op.loc, asm, ORA, v, true);
-                        instr(out, TAY);
-                        instr(out, TXA);
-                    },
-                    Binop::BitAnd => {
-                        let v = load_two_args(out, lhs, rhs, op, asm);
-
-                        instr8_opt(out, rhs, op.loc, asm, AND, v, false);
-                        instr(out, TAX);
-                        instr(out, TYA);
-                        instr8_opt(out, rhs, op.loc, asm, AND, v, true);
-                        instr(out, TAY);
-                        instr(out, TXA);
-                    },
+                    Binop::BitOr => binop_simple(out, asm, lhs, rhs, op, ORA, None),
+                    Binop::BitAnd => binop_simple(out, asm, lhs, rhs, op, AND, None),
                     Binop::BitShl => {
                         let v = load_two_args(out, lhs, rhs, op, asm);
 
@@ -973,29 +993,8 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
                         instr8(out, LDA, ZP, ZP_TMP_0);
                         instr8(out, LDY, ZP, ZP_TMP_1);
                     },
-                    Binop::Plus => {
-                        // load_arg(lhs, op.loc, out, asm);
-                        let v = load_two_args(out, lhs, rhs, op, asm);
-
-                        instr(out, CLC);
-                        instr8_opt(out, rhs, op.loc, asm, ADC, v, false);
-                        instr(out, TAX);
-                        instr(out, TYA);
-                        instr8_opt(out, rhs, op.loc, asm, ADC, v, true);
-                        instr(out, TAY);
-                        instr(out, TXA);
-                    },
-                    Binop::Minus  => {
-                        let v = load_two_args(out, lhs, rhs, op, asm);
-
-                        instr(out, SEC);
-                        instr8_opt(out, rhs, op.loc, asm, SBC, v, false);
-                        instr(out, TAX);
-                        instr(out, TYA);
-                        instr8_opt(out, rhs, op.loc, asm, SBC, v, true);
-                        instr(out, TAY);
-                        instr(out, TXA);
-                    },
+                    Binop::Plus => binop_simple(out, asm, lhs, rhs, op, ADC, Some(false)),
+                    Binop::Minus  => binop_simple(out, asm, lhs, rhs, op, SBC, Some(true)),
                     Binop::Mod => {
                         // !! TODO !! this should be implemented here and not as a B functions.
                         // TODO: current mod implementation is linear, we can do better.
@@ -1237,7 +1236,7 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
                 instr0(out, JMP, ABS);
                 add_reloc(out, RelocationKind::Label{func_name: name, label}, asm);
             },
-        }
+        };
     }
 
     if !last_is_return {
@@ -1466,6 +1465,7 @@ pub unsafe fn generate_extrns(out: *mut String_Builder, extrns: *const [*const c
             instr8(out, LDY, ZP, ZP_TMP_3);
 
             instr8(out, LDX, ZP, ZP_TMP_4);
+
             // if (negative == 1) {
             instr8(out, BEQ, REL, 12);
 
