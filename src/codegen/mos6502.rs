@@ -329,7 +329,56 @@ pub unsafe fn load_auto_var_ref(out: *mut String_Builder, index: usize, asm: *mu
     instr8(out, LDY, IMM, (STACK_PAGE >> 8) as u8);
 }
 
-pub unsafe fn load_arg(arg: Arg, loc: Loc, out: *mut String_Builder, asm: *mut Assembler) {
+// the operations here are not allowed to change any register exctept the target
+// and have to keep the carry flag.
+pub unsafe fn load_arg_simple(arg: Arg, loc: Loc, out: *mut String_Builder, asm: *mut Assembler,
+                              instr: Instr, high: bool) {
+    match arg {
+        Arg::RefExternal(name) => {
+            if !high {
+                instr0(out, instr, IMM);
+                add_reloc(out, RelocationKind::External {name, offset: 0, byte: Byte::Low}, asm);
+            } else {
+                instr0(out, instr, IMM);
+                add_reloc(out, RelocationKind::External {name, offset: 0, byte: Byte::High}, asm);
+            }
+        },
+        Arg::External(name) => {
+            if !high {
+                instr0(out, instr, ABS);
+                add_reloc(out, RelocationKind::External {name, offset: 0, byte: Byte::Both}, asm);
+            } else {
+                instr0(out, instr, ABS);
+                add_reloc(out, RelocationKind::External {name, offset: 1, byte: Byte::Both}, asm);
+            }
+        },
+        Arg::Literal(value) => {
+            if !high {
+                if value >= 65536 {
+                    diagf!(loc, c!("WARNING: contant $%X out of range for 16 bits\n"), value);
+                }
+                instr8(out, instr, IMM, value as u8);
+            } else {
+                instr8(out, instr, IMM, (value >> 8) as u8);
+            }
+        },
+        Arg::DataOffset(offset) => {
+            assert!(offset < 65536, "data offset out of range");
+            if !high {
+                instr0(out, instr, IMM);
+                add_reloc(out, RelocationKind::DataOffset{off: offset as u16, byte: Byte::Low}, asm);
+            } else {
+                instr0(out, instr, IMM);
+                add_reloc(out, RelocationKind::DataOffset{off: offset as u16, byte: Byte::High}, asm);
+            }
+        },
+        _ => unreachable!(),
+    }
+}
+
+// This returns None, if the argument is `simple` (i. e. it can be loaded by a single instruction),
+// this saves us from needlessly saving the value in zero page.
+pub unsafe fn load_arg_opt(arg: Arg, _loc: Loc, out: *mut String_Builder, asm: *mut Assembler) -> Option<()> {
     match arg {
         Arg::Deref(index) => {
             load_auto_var(out, index, asm);
@@ -348,36 +397,34 @@ pub unsafe fn load_arg(arg: Arg, loc: Loc, out: *mut String_Builder, asm: *mut A
             instr8(out, LDX, IMM, 0);
             instr8(out, LDA, IND_X, ZP_DEREF_0);
         },
-        Arg::RefExternal(name) => {
-            instr0(out, LDA, IMM);
-            add_reloc(out, RelocationKind::External {name, offset: 0, byte: Byte::Low}, asm);
-            instr0(out, LDY, IMM);
-            add_reloc(out, RelocationKind::External {name, offset: 0, byte: Byte::High}, asm);
-        },
-        Arg::External(name) => {
-            instr0(out, LDA, ABS);
-            add_reloc(out, RelocationKind::External {name, offset: 0, byte: Byte::Both}, asm);
-            instr0(out, LDY, ABS);
-            add_reloc(out, RelocationKind::External {name, offset: 1, byte: Byte::Both}, asm);
-        },
         Arg::AutoVar(index) => load_auto_var(out, index, asm),
         Arg::RefAutoVar(index) => load_auto_var_ref(out, index, asm),
-        Arg::Literal(value) => {
-            if value >= 65536 {
-                diagf!(loc, c!("WARNING: contant $%X out of range for 16 bits\n"), value);
-            }
-            instr8(out, LDA, IMM, value as u8);
-            instr8(out, LDY, IMM, (value >> 8) as u8);
-        },
-        Arg::DataOffset(offset) => {
-            assert!(offset < 65536, "data offset out of range");
-            instr0(out, LDA, IMM);
-            add_reloc(out, RelocationKind::DataOffset{off: offset as u16, byte: Byte::Low}, asm);
-            instr0(out, LDY, IMM);
-            add_reloc(out, RelocationKind::DataOffset{off: offset as u16, byte: Byte::High}, asm);
-        },
+        Arg::RefExternal(..) | Arg::External(..) | Arg::Literal(..) | Arg::DataOffset(..) =>
+            return None,
         Arg::Bogus => unreachable!("bogus-amogus"),
     };
+    Some(())
+}
+pub unsafe fn load_arg(arg: Arg, loc: Loc, out: *mut String_Builder, asm: *mut Assembler) {
+    if load_arg_opt(arg, loc, out, asm).is_none() {
+        load_arg_simple(arg, loc, out, asm,
+                        LDA, false);
+        load_arg_simple(arg, loc, out, asm,
+                        LDY, true);
+    }
+}
+
+pub unsafe fn instr8_opt(out: *mut String_Builder, arg: Arg, loc: Loc, asm: *mut Assembler,
+                         instr: Instr, v: Option<()>, high: bool) {
+    if v.is_some() {
+        if !high {
+            instr8(out, instr, ZP, ZP_RHS_L);
+        } else {
+            instr8(out, instr, ZP, ZP_RHS_H);
+        }
+    } else {
+        load_arg_simple(arg, loc, out, asm, instr, high);
+    }
 }
 
 pub unsafe fn store_auto(out: *mut String_Builder, index: usize, asm: *mut Assembler) {
@@ -435,9 +482,20 @@ pub unsafe fn pop16_discard(out: *mut String_Builder, asm: *mut Assembler) {
     instr(out, PLA);
 }
 
+// load lhs in Y:A, rhs in RHS_L:RHS_H, returns None, if optimizable
+pub unsafe fn load_two_args(out: *mut String_Builder, lhs: Arg, rhs: Arg, op: OpWithLocation, asm: *mut Assembler) -> Option<()>{
+    let r = load_arg_opt(rhs, op. loc, out, asm);
+    if let Some(_) = r {
+        instr8(out, STA, ZP, ZP_RHS_L);
+        instr8(out, STY, ZP, ZP_RHS_H);
+    }
+    load_arg(lhs, op.loc, out, asm);
+    r
+}
+
 // load lhs in Y:A, rhs in RHS_L:RHS_H
-pub unsafe fn load_two_args(out: *mut String_Builder, lhs: Arg, rhs: Arg, op: OpWithLocation, asm: *mut Assembler) {
-    load_arg(rhs, op.loc, out, asm);
+pub unsafe fn load_two_args_no_opt(out: *mut String_Builder, lhs: Arg, rhs: Arg, op: OpWithLocation, asm: *mut Assembler) {
+    load_arg(rhs, op. loc, out, asm);
     instr8(out, STA, ZP, ZP_RHS_L);
     instr8(out, STY, ZP, ZP_RHS_H);
     load_arg(lhs, op.loc, out, asm);
@@ -799,67 +857,65 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
                 store_auto(out, index, asm);
             },
             Op::Negate {result, arg} => { // Y:A -> 0 - Y:A
-                load_arg(arg, op.loc, out, asm);
-
-                instr8(out, STA, ZP, ZP_TMP_0);
-                instr8(out, STY, ZP, ZP_TMP_1);
+                let v = load_arg_opt(arg, op.loc, out, asm);
+                if v.is_some() {
+                    instr8(out, STA, ZP, ZP_TMP_0);
+                    instr8(out, STY, ZP, ZP_TMP_1);
+                }
 
                 instr8(out, LDA, IMM, 0);
                 instr(out, TAY);
 
                 instr(out, SEC);
-                instr8(out, SBC, ZP, ZP_TMP_0);
+                instr8_opt(out, arg, op.loc, asm, SBC, v, false);
                 instr(out, TAX);
                 instr(out, TYA);
-                instr8(out, SBC, ZP, ZP_TMP_1);
+                instr8_opt(out, arg, op.loc, asm, SBC, v, true);
                 instr(out, TAY);
                 instr(out, TXA);
 
                 store_auto(out, result, asm);
             },
             Op::UnaryNot{result, arg} => {
-                load_arg(arg, op.loc, out, asm);
+                if load_arg_opt(arg, op.loc, out, asm).is_some() {
+                    instr8(out, STY, ZP, ZP_TMP_0);
+                    instr8(out, ORA, ZP, ZP_TMP_0);
+                } else {
+                    load_arg_simple(arg, op.loc, out, asm, LDA, false);
+                    load_arg_simple(arg, op.loc, out, asm, ORA, true);
+                }
 
-                instr8(out, LDX, IMM, 0);
-
-                instr8(out, CMP, IMM, 0);
-                instr8(out, BNE, REL, 5);
-
-                instr(out, TYA);
-                instr8(out, CMP, IMM, 0);
-                instr8(out, BNE, REL, 1);
-
-                instr(out, INX);
-
-                instr(out, TXA);
-                instr8(out, LDY, IMM, 0);
+                instr8(out, BEQ, REL, 4);
+                instr8(out, LDA, IMM, 0);
+                instr8(out, BEQ, REL, 2);
+                instr8(out, LDA, IMM, 1);
 
                 store_auto(out, result, asm);
             },
             Op::Binop {binop, index, lhs, rhs} => {
                 match binop {
                     Binop::BitOr => {
-                        load_two_args(out, lhs, rhs, op, asm);
+                        let v = load_two_args(out, lhs, rhs, op, asm);
 
-                        instr8(out, ORA, ZP, ZP_RHS_L);
+                        instr8_opt(out, rhs, op.loc, asm, ORA, v, false);
                         instr(out, TAX);
                         instr(out, TYA);
-                        instr8(out, ORA, ZP, ZP_RHS_H);
+                        instr8_opt(out, rhs, op.loc, asm, ORA, v, true);
                         instr(out, TAY);
                         instr(out, TXA);
                     },
                     Binop::BitAnd => {
-                        load_two_args(out, lhs, rhs, op, asm);
+                        let v = load_two_args(out, lhs, rhs, op, asm);
 
-                        instr8(out, AND, ZP, ZP_RHS_L);
+                        instr8_opt(out, rhs, op.loc, asm, AND, v, false);
                         instr(out, TAX);
                         instr(out, TYA);
-                        instr8(out, AND, ZP, ZP_RHS_H);
+                        instr8_opt(out, rhs, op.loc, asm, AND, v, true);
                         instr(out, TAY);
                         instr(out, TXA);
                     },
                     Binop::BitShl => {
-                        load_two_args(out, lhs, rhs, op, asm);
+                        let v = load_two_args(out, lhs, rhs, op, asm);
 
                         instr8(out, STA, ZP, ZP_TMP_0);
                         instr8(out, STY, ZP, ZP_TMP_1);
@@ -867,7 +923,7 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
                         // as maximum shift is 16, Y can be ignored.
                         // TODO: only shift 16 times if value > 16 provided
                         // TODO: do we have to handle negative shifts?
-                        instr8(out, LDX, ZP, ZP_RHS_L);
+                        instr8_opt(out, rhs, op.loc, asm, LDX, v, false);
 
                         let loop_start = create_address_label_here(out, asm);
                         instr8(out, BEQ, REL, 8);
@@ -883,7 +939,7 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
                         instr8(out, LDY, ZP, ZP_TMP_1);
                     },
                     Binop::BitShr => {
-                        load_two_args(out, lhs, rhs, op, asm);
+                        let v = load_two_args(out, lhs, rhs, op, asm);
 
                         instr8(out, STA, ZP, ZP_TMP_0);
                         instr8(out, STY, ZP, ZP_TMP_1);
@@ -891,7 +947,7 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
                         // as maximum shift is 16, Y can be ignored.
                         // TODO: only shift 16 times if value > 16 provided
                         // TODO: do we have to handle negative shifts?
-                        instr8(out, LDX, ZP, ZP_RHS_L);
+                        instr8_opt(out, rhs, op.loc, asm, LDX, v, false);
 
                         let loop_start = create_address_label_here(out, asm);
                         instr8(out, BEQ, REL, 8);
@@ -907,24 +963,25 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
                         instr8(out, LDY, ZP, ZP_TMP_1);
                     },
                     Binop::Plus => {
-                        load_two_args(out, lhs, rhs, op, asm);
+                        // load_arg(lhs, op.loc, out, asm);
+                        let v = load_two_args(out, lhs, rhs, op, asm);
 
                         instr(out, CLC);
-                        instr8(out, ADC, ZP, ZP_RHS_L);
+                        instr8_opt(out, rhs, op.loc, asm, ADC, v, false);
                         instr(out, TAX);
                         instr(out, TYA);
-                        instr8(out, ADC, ZP, ZP_RHS_H);
+                        instr8_opt(out, rhs, op.loc, asm, ADC, v, true);
                         instr(out, TAY);
                         instr(out, TXA);
                     },
                     Binop::Minus  => {
-                        load_two_args(out, lhs, rhs, op, asm);
+                        let v = load_two_args(out, lhs, rhs, op, asm);
 
                         instr(out, SEC);
-                        instr8(out, SBC, ZP, ZP_RHS_L);
+                        instr8_opt(out, rhs, op.loc, asm, SBC, v, false);
                         instr(out, TAX);
                         instr(out, TYA);
-                        instr8(out, SBC, ZP, ZP_RHS_H);
+                        instr8_opt(out, rhs, op.loc, asm, SBC, v, true);
                         instr(out, TAY);
                         instr(out, TXA);
                     },
@@ -957,7 +1014,7 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
                         instr(out, TXA);
                     },
                     Binop::Mult => {
-                        load_two_args(out, lhs, rhs, op, asm);
+                        load_two_args_no_opt(out, lhs, rhs, op, asm);
 
                         // TODO: maybe move this to an intrinsic function,
                         // because it is rather long. Consider this, if we run
@@ -1051,17 +1108,17 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
 
                     // TODO: use same less code everywhere without duplication
                     Binop::Less => {
-                        load_two_args(out, lhs, rhs, op, asm);
+                        let v = load_two_args(out, lhs, rhs, op, asm);
                         // we subtract, then check sign
 
                         instr8(out, LDX, IMM, 1);
 
                         instr(out, SEC); // set carry
                         // sub low byte
-                        instr8(out, SBC, ZP, ZP_RHS_L);
+                        instr8_opt(out, rhs, op.loc, asm, SBC, v, false);
                         // sub high byte
                         instr(out, TYA);
-                        instr8(out, SBC, ZP, ZP_RHS_H);
+                        instr8_opt(out, rhs, op.loc, asm, SBC, v, true);
                         // high result in A, N flag if less.
 
                         // if less skip, we already have X=1
@@ -1072,17 +1129,17 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
                         instr8(out, LDY, IMM, 0);
                     },
                     Binop::Greater => { // A > B <=> B < A
-                        load_two_args(out, rhs, lhs, op, asm);
+                        let v = load_two_args(out, rhs, lhs, op, asm);
                         // we subtract, then check sign
 
                         instr8(out, LDX, IMM, 1);
 
                         instr(out, SEC); // set carry
                         // sub low byte
-                        instr8(out, SBC, ZP, ZP_RHS_L);
+                        instr8_opt(out, lhs, op.loc, asm, SBC, v, false);
                         // sub high byte
                         instr(out, TYA);
-                        instr8(out, SBC, ZP, ZP_RHS_H);
+                        instr8_opt(out, lhs, op.loc, asm, SBC, v, true);
                         // high result in A, N flag if less.
 
                         // if less skip, we already have X=1
@@ -1094,14 +1151,14 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
                         instr8(out, LDY, IMM, 0);
                     },
                     Binop::Equal => {
-                        load_two_args(out, lhs, rhs, op, asm);
+                        let v = load_two_args(out, lhs, rhs, op, asm);
 
                         instr8(out, LDX, IMM, 0);
 
-                        instr8(out, CMP, ZP, ZP_RHS_L);
+                        instr8_opt(out, rhs, op.loc, asm, CMP, v, false);
                         instr8(out, BNE, REL, 5);
 
-                        instr8(out, CPY, ZP, ZP_RHS_H);
+                        instr8_opt(out, rhs, op.loc, asm, CPY, v, true);
                         instr8(out, BNE, REL, 1);
 
                         instr(out, INX);
@@ -1109,14 +1166,14 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
                         instr8(out, LDY, IMM, 0);
                     },
                     Binop::NotEqual => {
-                        load_two_args(out, lhs, rhs, op, asm);
+                        let v = load_two_args(out, lhs, rhs, op, asm);
 
                         instr8(out, LDX, IMM, 1);
 
-                        instr8(out, CMP, ZP, ZP_RHS_L);
+                        instr8_opt(out, rhs, op.loc, asm, CMP, v, false);
                         instr8(out, BNE, REL, 5);
 
-                        instr8(out, CPY, ZP, ZP_RHS_H);
+                        instr8_opt(out, rhs, op.loc, asm, CPY, v, true);
                         instr8(out, BNE, REL, 1);
 
                         instr(out, DEX);
@@ -1124,17 +1181,17 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
                         instr8(out, LDY, IMM, 0);
                     },
                     Binop::GreaterEqual => { // A >= B <=> !(A < B)
-                        load_two_args(out, lhs, rhs, op, asm);
+                        let v = load_two_args(out, lhs, rhs, op, asm);
                         // we subtract, then check sign
 
                         instr8(out, LDX, IMM, 0);
 
                         instr(out, SEC); // set carry
                         // sub low byte
-                        instr8(out, SBC, ZP, ZP_RHS_L);
+                        instr8_opt(out, rhs, op.loc, asm, SBC, v, false);
                         // sub high byte
                         instr(out, TYA);
-                        instr8(out, SBC, ZP, ZP_RHS_H);
+                        instr8_opt(out, rhs, op.loc, asm, SBC, v, true);
                         // high result in A, N flag if less.
 
                         // if less skip, we already have X=0
@@ -1145,17 +1202,17 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
                         instr8(out, LDY, IMM, 0);
                     },
                     Binop::LessEqual => { // X <= Y <=> Y >= X <=> !(Y < X)
-                        load_two_args(out, rhs, lhs, op, asm);
+                        let v = load_two_args(out, rhs, lhs, op, asm);
                         // we subtract, then check sign
 
                         instr8(out, LDX, IMM, 0);
 
                         instr(out, SEC); // set carry
                         // sub low byte
-                        instr8(out, SBC, ZP, ZP_RHS_L);
+                        instr8_opt(out, lhs, op.loc, asm, SBC, v, false);
                         // sub high byte
                         instr(out, TYA);
-                        instr8(out, SBC, ZP, ZP_RHS_H);
+                        instr8_opt(out, lhs, op.loc, asm, SBC, v, true);
                         // high result in A, N flag if less.
 
                         // if greater skip, we already have X=0
