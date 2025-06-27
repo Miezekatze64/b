@@ -242,6 +242,17 @@ pub struct Assembler {
     pub addresses: Array<u16>,
     pub code_start: u16, // load address of code section
     pub frame_sz: u8, // current stack frame size in bytes, because 6502 has no base register
+
+    pub used_intrinsics: [bool; Intrinsic::COUNT as usize],
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Intrinsic {
+    IndirectJmp,
+    Mult,
+
+    COUNT
 }
 
 pub unsafe fn write_byte(out: *mut String_Builder, byte: u8) {
@@ -1016,96 +1027,11 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
                     Binop::Mult => {
                         load_two_args_no_opt(out, lhs, rhs, op, asm);
 
-                        // TODO: maybe move this to an intrinsic function,
-                        // because it is rather long. Consider this, if we run
-                        // out of memory at some point.
-
-                        // shift-and-add/long multiplication
-                        // see: https://en.wikipedia.org/wiki/Multiplication_algorithm
-
-                        // store lhs
-                        instr8(out, STA, ZP, ZP_TMP_0);
-                        instr8(out, STY, ZP, ZP_TMP_1);
-
-                        // shift 16 times
-                        instr8(out, LDA, IMM, 16);
-                        instr8(out, STA, ZP, ZP_TMP_5);
-
-                        ops::save_and_remove_signs(out, asm);
-
-                        // from here on: unsigned multiplication
-                        // store Y:A in ZP, because shifting and adding is easier
-                        // without all the register switching
-                        instr8(out, LDA, IMM, 0);
-                        instr8(out, STA, ZP, ZP_TMP_2);
-                        instr8(out, STA, ZP, ZP_TMP_3);
-
-                        let loop_start = create_address_label_here(out, asm);
-                        let cont = create_address_label(asm);
-                        let finished = create_address_label(asm);
-
-                        // if shifted 16 times, we are finished
-                        instr8(out, LDA, ZP, ZP_TMP_5);
-                        instr0(out, BNE, REL);
-                        add_reloc(out, RelocationKind::AddressRel{idx: cont}, asm);
-
-                        instr0(out, JMP, ABS);
-                        add_reloc(out, RelocationKind::AddressAbs{idx: finished}, asm);
-
-                        link_address_label_here(cont, out, asm);
-
-                        instr8(out, DEC, ZP, ZP_TMP_5);
-
-                        // shift left current accumulater between single adds
-                        instr8(out, ASL, ZP, ZP_TMP_2);
-                        instr8(out, ROL, ZP, ZP_TMP_3);
-
-                        instr8(out, ASL, ZP, ZP_RHS_L);
-                        instr8(out, ROL, ZP, ZP_RHS_H);
-
-                        // if bit is 0, do not add anything
-                        instr0(out, BCC, REL);
-                        add_reloc(out, RelocationKind::AddressRel{idx: loop_start}, asm);
-
-                        // bit is 1 here, we have to add entire lhs to acc
-                        instr(out, CLC);
-                        instr8(out, LDA, ZP, ZP_TMP_2); // acc, low
-                        instr8(out, ADC, ZP, ZP_TMP_0); // lhs, low
-                        instr8(out, STA, ZP, ZP_TMP_2); // acc, low
-
-                        instr8(out, LDA, ZP, ZP_TMP_3); // acc, high
-                        instr8(out, ADC, ZP, ZP_TMP_1); // lhs, high
-                        instr8(out, STA, ZP, ZP_TMP_3); // acc, high
-
-                        // continue loop
-                        instr0(out, JMP, ABS);
-                        add_reloc(out, RelocationKind::AddressAbs{idx: loop_start}, asm);
-                        link_address_label_here(finished, out, asm);
-
-                        // move back in Y:A
-                        instr8(out, LDA, ZP, ZP_TMP_2);
-                        instr8(out, LDY, ZP, ZP_TMP_3);
-
-                        instr8(out, LDX, ZP, ZP_TMP_4);
-                        // if (negative == 1) {
-                        instr8(out, BEQ, REL, 12);
-
-                        instr8(out, LDA, IMM, 0);
-                        instr(out, TAY);
-
-                        // Y:A = -Y:A
-                        instr(out, SEC);
-                        instr8(out, SBC, ZP, ZP_TMP_2);
-                        instr(out, TAX);
-                        instr(out, TYA);
-                        instr8(out, SBC, ZP, ZP_TMP_3);
-                        instr(out, TXA);
-                        instr(out, TAY);
-                        // }
-
-                        // missingf!(op.loc, c!("implement Mult\n"))
+                        instr0(out, JSR, ABS);
+                        add_reloc(out, RelocationKind::External{name: c!("$mult"), offset: 0,
+                                                                byte: Byte::Both}, asm);
+                        (*asm).used_intrinsics[Intrinsic::Mult as usize] = true;
                     },
-
                     // TODO: use same less code everywhere without duplication
                     Binop::Less => {
                         let v = load_two_args(out, lhs, rhs, op, asm);
@@ -1258,6 +1184,7 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
                     _ => { // function pointer already loaded in ZP_DEREF_FUN
                         // there is no jsr (indirect), so emulate using jsr and jmp (indirect).
                         instr0(out, JSR, ABS);
+                        (*asm).used_intrinsics[Intrinsic::IndirectJmp as usize] = true;
                         add_reloc(out, RelocationKind::External{name: c!("$indirect_jmp"), offset: 0, byte: Byte::Both}, asm);
                     },
                 }
@@ -1471,6 +1398,91 @@ pub unsafe fn generate_extrns(out: *mut String_Builder, extrns: *const [*const c
             instr(out, RTS);
         } else if strcmp(name, c!("$indirect_jmp")) == 0 {
             instr16(out, JMP, IND, ZP_DEREF_FUN_0 as u16);
+        } else if strcmp(name, c!("$mult")) == 0 {
+            // shift-and-add/long multiplication
+            // see: https://en.wikipedia.org/wiki/Multiplication_algorithm
+
+            // store lhs
+            instr8(out, STA, ZP, ZP_TMP_0);
+            instr8(out, STY, ZP, ZP_TMP_1);
+
+            // shift 16 times
+            instr8(out, LDA, IMM, 16);
+            instr8(out, STA, ZP, ZP_TMP_5);
+
+            ops::save_and_remove_signs(out, asm);
+
+            // from here on: unsigned multiplication
+            // store Y:A in ZP, because shifting and adding is easier
+            // without all the register switching
+            instr8(out, LDA, IMM, 0);
+            instr8(out, STA, ZP, ZP_TMP_2);
+            instr8(out, STA, ZP, ZP_TMP_3);
+
+            let loop_start = create_address_label_here(out, asm);
+            let cont = create_address_label(asm);
+            let finished = create_address_label(asm);
+
+            // if shifted 16 times, we are finished
+            instr8(out, LDA, ZP, ZP_TMP_5);
+            instr0(out, BNE, REL);
+            add_reloc(out, RelocationKind::AddressRel{idx: cont}, asm);
+
+            instr0(out, JMP, ABS);
+            add_reloc(out, RelocationKind::AddressAbs{idx: finished}, asm);
+
+            link_address_label_here(cont, out, asm);
+
+            instr8(out, DEC, ZP, ZP_TMP_5);
+
+            // shift left current accumulater between single adds
+            instr8(out, ASL, ZP, ZP_TMP_2);
+            instr8(out, ROL, ZP, ZP_TMP_3);
+
+            instr8(out, ASL, ZP, ZP_RHS_L);
+            instr8(out, ROL, ZP, ZP_RHS_H);
+
+            // if bit is 0, do not add anything
+            instr0(out, BCC, REL);
+            add_reloc(out, RelocationKind::AddressRel{idx: loop_start}, asm);
+
+            // bit is 1 here, we have to add entire lhs to acc
+            instr(out, CLC);
+            instr8(out, LDA, ZP, ZP_TMP_2); // acc, low
+            instr8(out, ADC, ZP, ZP_TMP_0); // lhs, low
+            instr8(out, STA, ZP, ZP_TMP_2); // acc, low
+
+            instr8(out, LDA, ZP, ZP_TMP_3); // acc, high
+            instr8(out, ADC, ZP, ZP_TMP_1); // lhs, high
+            instr8(out, STA, ZP, ZP_TMP_3); // acc, high
+
+            // continue loop
+            instr0(out, JMP, ABS);
+            add_reloc(out, RelocationKind::AddressAbs{idx: loop_start}, asm);
+            link_address_label_here(finished, out, asm);
+
+            // move back in Y:A
+            instr8(out, LDA, ZP, ZP_TMP_2);
+            instr8(out, LDY, ZP, ZP_TMP_3);
+
+            instr8(out, LDX, ZP, ZP_TMP_4);
+            // if (negative == 1) {
+            instr8(out, BEQ, REL, 12);
+
+            instr8(out, LDA, IMM, 0);
+            instr(out, TAY);
+
+            // Y:A = -Y:A
+            instr(out, SEC);
+            instr8(out, SBC, ZP, ZP_TMP_2);
+            instr(out, TAX);
+            instr(out, TYA);
+            instr8(out, SBC, ZP, ZP_TMP_3);
+            instr(out, TXA);
+            instr(out, TAY);
+            // }
+
+            instr(out, RTS);
         } else {
             fprintf(stderr(), c!("Unknown extrn: `%s`, can not link\n"), name);
             abort();
@@ -1561,8 +1573,13 @@ pub unsafe fn generate_asm_funcs(out: *mut String_Builder, asm_funcs: *const [As
     }
 }
 
-pub unsafe fn add_instrinsics(c: *mut Compiler) {
-    da_append(&mut (*c).extrns, c!("$indirect_jmp"));
+pub unsafe fn add_instrinsics(c: *mut Compiler, asm: *const Assembler) {
+    if (*asm).used_intrinsics[Intrinsic::IndirectJmp as usize] {
+        da_append(&mut (*c).extrns, c!("$indirect_jmp"));
+    }
+    if (*asm).used_intrinsics[Intrinsic::Mult as usize] {
+        da_append(&mut (*c).extrns, c!("$mult"));
+    }
 }
 
 pub unsafe fn generate_program(out: *mut String_Builder, c: *mut Compiler, config: Config) -> Option<()> {
@@ -1573,7 +1590,7 @@ pub unsafe fn generate_program(out: *mut String_Builder, c: *mut Compiler, confi
     generate_funcs(out, da_slice((*c).funcs), &mut asm);
     generate_asm_funcs(out, da_slice((*c).asm_funcs), &mut asm);
 
-    add_instrinsics(c);
+    add_instrinsics(c, &asm);
     generate_extrns(out, da_slice((*c).extrns), da_slice((*c).funcs), da_slice((*c).globals), &mut asm);
 
     let data_start = config.load_offset + (*out).count as u16;
