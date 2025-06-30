@@ -341,7 +341,7 @@ pub unsafe fn load_auto_var_ref(out: *mut String_Builder, index: usize, asm: *mu
 }
 
 // The operations here are not allowed to change any register exctept the target
-// and have to keep the carry flag. Do NOT modify X here!
+// and have to keep the carry flag.
 pub unsafe fn load_arg_simple(arg: Arg, loc: Loc, out: *mut String_Builder, asm: *mut Assembler,
                               instr: Instr, high: bool) {
     match arg {
@@ -402,12 +402,11 @@ pub unsafe fn load_arg_opt(arg: Arg, _loc: Loc, out: *mut String_Builder, asm: *
             // Y = ((0),1)
             instr8(out, LDY, IMM, 1);
             instr8(out, LDA, IND_Y, ZP_DEREF_0);
-            instr8(out, STA, ZP, ZP_TMP_0);
+            instr(out, TAY);
 
             // A = ((0), 0)
-            instr(out, DEY);
-            instr8(out, LDA, IND_Y, ZP_DEREF_0);
-            instr8(out, LDY, ZP, ZP_TMP_0);
+            instr8(out, LDX, IMM, 0);
+            instr8(out, LDA, IND_X, ZP_DEREF_0);
         },
         Arg::AutoVar(index) => load_auto_var(out, index, asm),
         Arg::RefAutoVar(index) => load_auto_var_ref(out, index, asm),
